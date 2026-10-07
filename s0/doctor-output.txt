@@ -1,0 +1,28 @@
+Windows PowerShell
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+PS C:\Users\BILJO> git clone https://github.com/BiljoB/eai-2026-babu
+Cloning into 'eai-2026-babu'...
+warning: You appear to have cloned an empty repository.
+PS C:\Users\BILJO> cd eai-2026/s0
+PS C:\Users\BILJO\eai-2026\s0> docker compose pull
+[+] pull 2/2
+ ✔ Image nginx:1.27-alpine  Pulled                                                                                  3.0s
+ ✔ Image postgres:18-alpine Pulled                                                                                  3.0s
+PS C:\Users\BILJO\eai-2026\s0> docker compose up -d --wait --wait-timeout 180
+[+] up 2/2
+ ✔ Container eai-s0-echo     Healthy                                                                                0.6s
+ ✔ Container eai-s0-postgres Healthy                                                                                0.6s
+PS C:\Users\BILJO\eai-2026\s0> powershell -ExecutionPolicy Bypass -File .\doctor.ps1
+EAI 2026 - Session 0 doctor
+===========================
+
+[1/7] Docker daemon reachable         PASS
+[2/7] Compose v2 present              PASS
+[3/7] Both containers running         PASS
+[4/7] Both containers healthy         PASS
+[5/7] Ports 8080 and 5432 bound       PASS
+[6/7] Seed row readable from Postgres PASS
+[7/7] Free disk space above 5 GB      PASS
+
+DOCTOR: PASS
