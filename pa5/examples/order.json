@@ -1,0 +1,29 @@
+﻿{
+  "orderId": "ORD-1001",
+  "orderType": "standard",
+  "source": "web",
+  "receivedAt": "2026-10-06T12:00:00Z",
+  "orderDate": "2026-10-06",
+  "customer": {
+    "name": "Anna Berzina",
+    "email": "anna@example.com",
+    "address": {
+      "street": "Brivibas iela 1",
+      "city": "Riga",
+      "postalCode": "LV-1010",
+      "country": "LV"
+    }
+  },
+  "items": [
+    {
+      "productId": "PROD-1",
+      "productName": "Test Widget",
+      "quantity": 2,
+      "unitPrice": "24.99",
+      "currency": "EUR",
+      "taxRate": 0.21
+    }
+  ],
+  "currency": "EUR",
+  "status": "new"
+}
