@@ -1,19 +1,7 @@
 /**
- * PA6 orchestrator scaffold — ported from the practice-03-orchestration JS lab.
- *
- * This scaffold is intentionally incomplete. `GET /health`, request validation
- * against the canonical order schema, the Idempotency-Key contract shell, and
- * restart-safe file persistence are already wired up. What is NOT implemented
- * is the actual saga:
- *
- *   1) payment authorize
- *   2) inventory reserve
- *   3) shipping create
- *   4) notification send
- *
- * with strict sequencing, trace recording, timeout handling, compensation
- * (in reverse order of completed steps), and the full idempotent-replay
- * policy. See the TODO block inside the POST /checkout handler.
+ * PA6 orchestrator: saga over payment, inventory, shipping, notification.
+ * Strict sequencing, timeouts, compensation in reverse order, idempotency,
+ * restart-safe file persistence.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -61,9 +49,11 @@ const DATA_DIR = "/data";
 const IDEMPOTENCY_STORE_PATH = path.join(DATA_DIR, "idempotency-store.json");
 const SAGA_STORE_PATH = path.join(DATA_DIR, "saga-store.json");
 
+// Must match maxItems on the items array in openapi.yaml.
+const MAX_ITEMS = 25;
+
 // ---------------------------------------------------------------- contract --
-// These shapes mirror grading/schema/*.json. Keep them in sync if you change
-// either side — the tests validate persisted files against those schemas.
+// These shapes mirror grading/schema/*.json.
 
 export interface TraceItem {
   step: string;
@@ -130,15 +120,13 @@ function payloadHash(payload: unknown): string {
 }
 
 // The request body is a canonical order. docker-compose.yml mounts the
-// course's canonical/ folder read-only at /canonical, so the orchestrator
-// validates against the very file PA4's output was validated against.
+// canonical/ folder read-only at /canonical.
 const CANONICAL_SCHEMA_PATH = "/canonical/order.schema.json";
 
 if (!fs.existsSync(CANONICAL_SCHEMA_PATH)) {
   throw new Error(
     `${CANONICAL_SCHEMA_PATH} not found. docker-compose.yml mounts ../canonical ` +
-      "from your repository root: copy canonical/ from eai-2026 next to pa6/ " +
-      '(root README, "Starting an assignment"), then run docker compose up again.',
+      "from your repository root: copy canonical/ next to pa6/, then run docker compose up again.",
   );
 }
 
@@ -158,6 +146,294 @@ function bootstrapStores(): void {
   ensureJsonFile(SAGA_STORE_PATH, { sagas: {} });
 }
 
+// ------------------------------------------------------------ saga helpers --
+
+// Money is handled as whole cents (integers). No floats anywhere.
+function toCents(price: string): number {
+  const m = /^(\d+)(?:\.(\d{1,2}))?$/.exec(String(price).trim());
+  if (!m) throw new Error(`Invalid money value: ${price}`);
+  const whole = parseInt(m[1] ?? "0", 10);
+  const frac = parseInt((m[2] ?? "").padEnd(2, "0"), 10);
+  return whole * 100 + frac;
+}
+
+function fromCents(cents: number): string {
+  return `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, "0")}`;
+}
+
+interface CallOutcome {
+  ok: boolean;
+  timedOut: boolean;
+  code: string;
+  message: string;
+  trace: TraceItem;
+}
+
+function extractErrorCode(text: string): { code: string; message: string } {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
+  }
+  const code =
+    parsed?.code ??
+    parsed?.error?.code ??
+    (typeof parsed?.error === "string" ? parsed.error : undefined) ??
+    "downstream_error";
+  const message = parsed?.message ?? parsed?.error?.message ?? "Downstream call failed";
+  return { code: String(code), message: String(message) };
+}
+
+async function callDownstream(step: string, url: string, body: unknown): Promise<CallOutcome> {
+  const startedMs = Date.now();
+  const startedAt = new Date(startedMs).toISOString();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+
+  let ok = false;
+  let timedOut = false;
+  let code = "downstream_error";
+  let message = "Downstream call failed";
+
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await r.text();
+    ok = r.ok;
+    if (!ok) {
+      ({ code, message } = extractErrorCode(text));
+    }
+  } catch {
+    if (controller.signal.aborted) {
+      timedOut = true;
+      code = "timeout";
+      message = `${step} did not answer within ${config.requestTimeoutMs} ms`;
+    } else {
+      code = "downstream_unavailable";
+      message = `${step} could not be reached`;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const finishedMs = Date.now();
+  return {
+    ok,
+    timedOut,
+    code,
+    message,
+    trace: {
+      step,
+      status: ok ? "success" : timedOut ? "timeout" : "failed",
+      startedAt,
+      finishedAt: new Date(finishedMs).toISOString(),
+      durationMs: finishedMs - startedMs,
+    },
+  };
+}
+
+interface Step {
+  name: string;
+  url: string;
+  body: unknown;
+  comp?: { name: string; url: string; body: unknown };
+}
+
+function persistAndRespond(
+  res: Response,
+  idempotencyKey: string,
+  requestHash: string,
+  orderId: string,
+  httpStatus: number,
+  state: SagaState,
+  responseBody: unknown,
+  trace: TraceItem[],
+): void {
+  // Saga store first, idempotency record last, so a replay always has a saga behind it.
+  const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
+  if (!sagaStore.sagas) sagaStore.sagas = {};
+  sagaStore.sagas[orderId] = { idempotencyKey, state, steps: trace, updatedAt: nowIso() };
+  writeJsonFile(SAGA_STORE_PATH, sagaStore);
+
+  const idemStore = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+  if (!idemStore.records) idemStore.records = {};
+  idemStore.records[idempotencyKey] = {
+    requestHash,
+    state,
+    httpStatus,
+    response: responseBody,
+    updatedAt: nowIso(),
+  };
+  writeJsonFile(IDEMPOTENCY_STORE_PATH, idemStore);
+
+  res.status(httpStatus).json(responseBody);
+}
+
+async function handleCheckout(req: Request, res: Response): Promise<void> {
+  const idempotencyKey = req.header("Idempotency-Key");
+  if (!idempotencyKey) {
+    res.status(400).json({ code: "validation_error", message: "Idempotency-Key header is required" });
+    return;
+  }
+
+  const validationError = validateCheckoutPayload(req.body);
+  if (validationError) {
+    res.status(400).json({ code: "validation_error", message: validationError });
+    return;
+  }
+
+  const order = req.body as CanonicalOrder;
+  const orderId = order.orderId;
+  const items = order.items as unknown as Array<{ unitPrice: string; quantity: number }>;
+
+  // The bound promised by the contract (the canonical schema does not enforce it).
+  if (items.length > MAX_ITEMS) {
+    res.status(400).json({
+      code: "validation_error",
+      message: `Order has ${items.length} items; the maximum is ${MAX_ITEMS}`,
+    });
+    return;
+  }
+
+  let amount: string;
+  try {
+    amount = fromCents(items.reduce((sum, it) => sum + toCents(it.unitPrice) * it.quantity, 0));
+  } catch (err) {
+    res.status(400).json({ code: "validation_error", message: (err as Error).message });
+    return;
+  }
+
+  // ---- idempotency: check and claim the key with no await in between ----
+  const requestHash = payloadHash(req.body);
+  const idempotencyStore = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+  if (!idempotencyStore.records) idempotencyStore.records = {};
+
+  const existing = idempotencyStore.records[idempotencyKey];
+  if (existing) {
+    if (existing.requestHash !== requestHash) {
+      res.status(409).json({
+        code: "idempotency_payload_mismatch",
+        message: "This Idempotency-Key is already used for a different payload",
+      });
+      return;
+    }
+    if (existing.state === "in_progress") {
+      res.status(409).json({
+        code: "idempotency_conflict",
+        message: "A request with this Idempotency-Key is still being processed",
+      });
+      return;
+    }
+    // Finished: replay exactly. The saga does not run again.
+    res.status(existing.httpStatus).json(existing.response);
+    return;
+  }
+
+  idempotencyStore.records[idempotencyKey] = {
+    requestHash,
+    state: "in_progress",
+    httpStatus: 202,
+    response: { orderId, status: "in_progress" },
+    updatedAt: nowIso(),
+  };
+  writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
+
+  // ---- the saga ----
+  const trace: TraceItem[] = [];
+  try {
+    const steps: Step[] = [
+      {
+        name: "payment",
+        url: `${config.paymentUrl}/payment/authorize`,
+        body: { orderId, amount },
+        comp: { name: "payment_refund", url: `${config.paymentUrl}/payment/refund`, body: { orderId } },
+      },
+      {
+        name: "inventory",
+        url: `${config.inventoryUrl}/inventory/reserve`,
+        body: { orderId, items: order.items },
+        comp: { name: "inventory_release", url: `${config.inventoryUrl}/inventory/release`, body: { orderId } },
+      },
+      { name: "shipping", url: `${config.shippingUrl}/shipping/create`, body: { orderId } },
+      {
+        name: "notification",
+        url: `${config.notificationUrl}/notification/send`,
+        body: { orderId, recipient: order.customer.email },
+      },
+    ];
+
+    const completed: Step[] = [];
+    for (const step of steps) {
+      const result = await callDownstream(step.name, step.url, step.body); // strictly one at a time
+      trace.push(result.trace);
+      if (result.ok) {
+        completed.push(step);
+        continue;
+      }
+
+      // Failure: compensate the completed steps in reverse order.
+      let compensationFailed = false;
+      for (const done of [...completed].reverse()) {
+        if (!done.comp) continue;
+        const c = await callDownstream(done.comp.name, done.comp.url, done.comp.body);
+        trace.push(c.trace);
+        if (!c.ok) compensationFailed = true; // still try the remaining compensations
+      }
+
+      if (compensationFailed) {
+        persistAndRespond(
+          res, idempotencyKey, requestHash, orderId, 422, "failed",
+          {
+            orderId,
+            status: "failed",
+            code: "compensation_failed",
+            message: "A compensation call failed; manual reconciliation is needed",
+            trace,
+          },
+          trace,
+        );
+        return;
+      }
+
+      const state: SagaState = completed.length > 0 ? "compensated" : "failed";
+      const httpStatus = result.timedOut ? 504 : 422;
+      persistAndRespond(
+        res, idempotencyKey, requestHash, orderId, httpStatus, state,
+        {
+          orderId,
+          status: state,
+          code: result.timedOut ? "timeout" : result.code,
+          message: result.message,
+          trace,
+        },
+        trace,
+      );
+      return;
+    }
+
+    persistAndRespond(
+      res, idempotencyKey, requestHash, orderId, 200, "completed",
+      { orderId, status: "completed", trace },
+      trace,
+    );
+  } catch (err) {
+    // Unexpected crash: free the key so the client can retry.
+    const store = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+    if (store.records) {
+      delete store.records[idempotencyKey];
+      writeJsonFile(IDEMPOTENCY_STORE_PATH, store);
+    }
+    throw err;
+  }
+}
+
+// ------------------------------------------------------------------ routes --
+
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({ status: "ok" });
 });
@@ -173,119 +449,15 @@ app.get("/debug/trace/:orderId", (req: Request, res: Response) => {
   res.status(200).json(saga);
 });
 
-app.post("/checkout", (req: Request, res: Response) => {
-  const idempotencyKey = req.header("Idempotency-Key");
-  if (!idempotencyKey) {
-    res.status(400).json({
-      code: "validation_error",
-      message: "Idempotency-Key header is required",
-    });
-    return;
-  }
-
-  const validationError = validateCheckoutPayload(req.body);
-  if (validationError) {
-    res.status(400).json({
-      code: "validation_error",
-      message: validationError,
-    });
-    return;
-  }
-
-  const requestHash = payloadHash(req.body);
-  const idempotencyStore = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
-  if (!idempotencyStore.records) {
-    idempotencyStore.records = {};
-  }
-
-  const existing = idempotencyStore.records[idempotencyKey];
-  if (existing) {
-    if (existing.requestHash !== requestHash) {
-      res.status(409).json({
-        code: "idempotency_payload_mismatch",
-        message: "This Idempotency-Key is already used for a different payload",
-      });
-      return;
+app.post("/checkout", async (req: Request, res: Response) => {
+  try {
+    await handleCheckout(req, res);
+  } catch (err) {
+    console.error("[orchestrator] unexpected error", err);
+    if (!res.headersSent) {
+      res.status(500).json({ code: "internal_error", message: "Unexpected error" });
     }
-
-    // Starter behavior for in-progress/previous same-key requests is intentionally minimal.
-    // Students must implement full replay/conflict strategy and document it in the ADR.
-    res.status(409).json({
-      code: "idempotency_conflict",
-      message: "Starter scaffold does not implement duplicate replay handling yet",
-    });
-    return;
   }
-
-  const order = req.body as CanonicalOrder;
-  const orderId = order.orderId;
-  idempotencyStore.records[idempotencyKey] = {
-    requestHash,
-    state: "in_progress",
-    httpStatus: 202,
-    response: {
-      orderId,
-      status: "in_progress",
-    },
-    updatedAt: nowIso(),
-  };
-  writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
-
-  // --------------------------------------------------------------------------
-  // TODO (student): Implement full orchestration flow. README.md §4 has the
-  // exact request bodies, trace step names and the outcome table.
-  //   1) payment authorize   { orderId, amount }
-  //   2) inventory reserve   { orderId, items }
-  //   3) shipping create     { orderId }
-  //   4) notification send   { orderId, recipient }
-  // with strict sequencing, trace recording, timeout handling, compensation
-  // (in reverse order of the steps that actually completed), idempotent
-  // replay policy, and restart-safe persistence updates.
-  //
-  // The canonical order carries neither an amount nor a recipient:
-  //   - amount    = the sum of unitPrice × quantity over order.items, sent as
-  //                 a decimal string with two fraction digits ("49.50").
-  //                 unitPrice is already a string: add up whole cents as
-  //                 integers, then format once. Never go through a float.
-  //   - recipient = order.customer.email
-  //
-  // config.paymentUrl / config.inventoryUrl / config.shippingUrl /
-  // config.notificationUrl / config.requestTimeoutMs are already loaded from
-  // the environment above — use them, do not hardcode downstream URLs.
-  // --------------------------------------------------------------------------
-
-  const trace: TraceItem[] = [];
-
-  const scaffoldResponse = {
-    orderId,
-    status: "failed" as const,
-    code: "not_implemented",
-    message: "Implement orchestration logic in orchestrator/src/server.ts",
-    trace,
-  };
-
-  const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
-  if (!sagaStore.sagas) {
-    sagaStore.sagas = {};
-  }
-  sagaStore.sagas[orderId] = {
-    idempotencyKey,
-    state: "failed",
-    steps: trace,
-    updatedAt: nowIso(),
-  };
-  writeJsonFile(SAGA_STORE_PATH, sagaStore);
-
-  idempotencyStore.records[idempotencyKey] = {
-    requestHash,
-    state: "failed",
-    httpStatus: 422,
-    response: scaffoldResponse,
-    updatedAt: nowIso(),
-  };
-  writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
-
-  res.status(422).json(scaffoldResponse);
 });
 
 bootstrapStores();
