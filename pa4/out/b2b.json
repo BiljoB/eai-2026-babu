@@ -1,0 +1,40 @@
+{
+  "order": {
+    "orderId": "B2B-2026-100",
+    "orderType": "b2b",
+    "source": "b2b",
+    "receivedAt": "2026-09-29T15:04:45.006Z",
+    "orderDate": "2026-09-01T10:30:00.000Z",
+    "customer": {
+      "name": "Anna Bērziņa",
+      "email": "anna.berzina@example.com",
+      "address": {
+        "street": "Brīvības iela 100",
+        "city": "Rīga",
+        "postalCode": "LV-1001",
+        "country": "LV"
+      }
+    },
+    "items": [
+      {
+        "productId": "PROD-001",
+        "productName": "Wireless Mouse",
+        "quantity": 2,
+        "unitPrice": "22.50",
+        "currency": "EUR",
+        "taxRate": 0.21
+      },
+      {
+        "productId": "PROD-002",
+        "productName": "USB-C Hub",
+        "quantity": 1,
+        "unitPrice": "45.30",
+        "currency": "EUR",
+        "taxRate": 0.21
+      }
+    ],
+    "currency": "EUR",
+    "status": "new"
+  },
+  "warnings": []
+}
