@@ -75,6 +75,8 @@ services:
     environment:
       PORT: "8801"
       RABBITMQ_URL: amqp://eai:eai-capstone@rabbitmq:5672
+      RABBITMQ_MGMT_URL: http://rabbitmq:15672
+      ORCHESTRATOR_URL: http://orchestrator:8802
       DATA_DIR: /data
     volumes:
       - observer-data:/data

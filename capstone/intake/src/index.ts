@@ -276,6 +276,79 @@ app.get("/orders/:cid", (req, res) => {
   const rec = orders[req.params.cid];
   rec ? res.json(rec) : res.status(404).json({ code: "not_found" });
 });
+const DLQ_MAX = Number(process.env.MAX_RETRIES || 3);
+
+async function drainDlq() {
+  const out = [];
+  for (;;) {
+    const m = await pubCh.get("orders.dlq", { noAck: false });
+    if (!m) break;
+    out.push(m);
+  }
+  return out;
+}
+
+app.get("/dlq", async (_req, res) => {
+  if (!pubCh) return res.status(503).json({ code: "broker_unavailable" });
+  try {
+    const msgs = await drainDlq();
+    const entries = msgs.map((m) => {
+      const h = m.properties.headers || {};
+      return {
+        messageId: m.properties.messageId || randomUUID(),
+        correlationId: String(h.correlationId || ""),
+        originQueue: String(h.originQueue || ""),
+        attempts: Number(h.attempts || DLQ_MAX),
+        lastError: String(h.lastError || "unknown"),
+        deadLetteredAt: String(h.deadLetteredAt || new Date().toISOString()),
+      };
+    });
+    for (const m of msgs) pubCh.nack(m, false, true); // put them all back
+    res.json({ count: entries.length, entries });
+  } catch (e) {
+    res.status(500).json({ code: "dlq_error", message: String(e.message) });
+  }
+});
+
+app.post("/dlq/replay", express.json(), async (req, res) => {
+  if (!pubCh) return res.status(503).json({ code: "broker_unavailable" });
+  const cid = req.body && req.body.correlationId;
+  try {
+    const msgs = await drainDlq();
+    let replayed = 0;
+    for (const m of msgs) {
+      const h = m.properties.headers || {};
+      if (cid && h.correlationId !== cid) { pubCh.nack(m, false, true); continue; }
+      const hopId = randomUUID();
+      const t0 = new Date();
+      const headers = {};
+      for (const [k, v] of Object.entries(h)) {
+        if (!k.startsWith("x-") && !["lastError", "originQueue", "attempts", "deadLetteredAt"].includes(k)) headers[k] = v;
+      }
+      headers.correlationId = h.correlationId;
+      headers.causationId = hopId;
+      try {
+        await new Promise((resolve, reject) =>
+          pubCh.publish("orders.return.exchange", String(h.originQueue), m.content,
+            { persistent: true, messageId: randomUUID(), contentType: "application/json", headers },
+            (err) => (err ? reject(err) : resolve())));
+      } catch (e) { pubCh.nack(m, false, true); continue; }
+      pubCh.ack(m); // only after the broker confirmed
+      replayed++;
+      try {
+        pubCh.publish("trace.events", "", Buffer.from(JSON.stringify({
+          hopId, correlationId: h.correlationId, causationId: h.causationId ?? null,
+          service: "intake", operation: "dlq.replay", status: "success", attempt: 1,
+          startedAt: t0.toISOString(), finishedAt: new Date().toISOString(), durationMs: Date.now() - t0.getTime(),
+        })), { persistent: true, contentType: "application/json", messageId: randomUUID(), headers: { correlationId: h.correlationId } });
+      } catch {}
+    }
+    const q = await pubCh.checkQueue("orders.dlq");
+    res.json({ replayed, remaining: q.messageCount });
+  } catch (e) {
+    res.status(500).json({ code: "replay_error", message: String(e.message) });
+  }
+});
 app.get("/health", (_req, res) => {
   const ok = connected && consuming;
   res.status(ok ? 200 : 503).json({ status: ok ? "ok" : "degraded", checks: { broker: connected ? "up" : "down", consumers: consuming ? { [OUTCOME_Q]: 1 } : {} } });
