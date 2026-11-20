@@ -1,169 +1,270 @@
-// @ts-nocheck  (keeps the build from failing on type details while time is short)
 import express from "express";
 import amqp from "amqplib";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
-import { XMLParser } from "fast-xml-parser";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
 const env = process.env;
 const DATA_DIR = env.DATA_DIR || "/data";
 const TIMEOUT = Number(env.REQUEST_TIMEOUT_MS || 2500);
-const ITEMS_MAX = Number(env.ORDER_ITEMS_MAX || 50);
-const PRICING_URL = env.PRICING_URL;
-const PRICING_KEY = env.PRICING_API_KEY;
-const OUTCOME_Q = "intake.outcome.queue";
+const MAX_RETRIES = Number(env.MAX_RETRIES || 3);
+const CONC = Number(env.SAGA_CONCURRENCY || 5);
+const RUN_ID = randomUUID();
+const SAGA_Q = "saga.queue";
+const URLS = { payment: env.PAYMENT_URL, inventory: env.INVENTORY_URL, shipping: env.SHIPPING_URL, notification: env.NOTIFICATION_URL };
+const TERMINAL = ["completed", "failed", "compensated", "compensation_failed", "needs_attention", "duplicate"];
 
-/* ---------- stores ---------- */
-function loadJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), "utf8")); } catch { return fallback; }
-}
-const idem = loadJson("idempotency-store.json", {});   // only finished (done) entries
-const orders = loadJson("orders.json", {});
-const inflight = new Map();                             // key -> sha256 (in memory only)
+/* ---------- store ---------- */
+let store = { sagas: {}, businessKeys: {} };
+try {
+  store = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "saga-store.json"), "utf8"));
+  store.sagas = store.sagas || {}; store.businessKeys = store.businessKeys || {};
+} catch {}
 let writing = Promise.resolve();
-function save(file, data) {
+function save() {
+  const snap = JSON.stringify(store);
   writing = writing.then(async () => {
-    const p = path.join(DATA_DIR, file);
-    const tmp = p + ".tmp";
-    await fs.promises.writeFile(tmp, JSON.stringify(data));
-    await fs.promises.rename(tmp, p);
+    const p = path.join(DATA_DIR, "saga-store.json");
+    await fs.promises.writeFile(p + ".tmp", snap);
+    await fs.promises.rename(p + ".tmp", p);
   }).catch((e) => console.error("save failed", e.message));
   return writing;
 }
+const now = () => new Date().toISOString();
 
 /* ---------- validation ---------- */
 const ajv = new Ajv({ allErrors: true, strict: false });
 addFormats(ajv);
-const schema = JSON.parse(fs.readFileSync(path.join(env.CANONICAL_DIR || "/canonical", "order.schema.json"), "utf8"));
-const validateOrder = ajv.compile(schema);
-
-class Reject extends Error {
-  constructor(status, body, headers = {}, remember = false) { super(body?.code || "reject"); this.status = status; this.body = body; this.headers = headers; this.remember = remember; }
-}
-const bad = (m) => new Reject(400, { code: "validation_error", message: m });
-const need = (v, name) => {
-  if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) throw bad(`missing ${name}`);
-  return v;
-};
-const iso = (v, name) => { const d = new Date(v); if (isNaN(d.getTime())) throw bad(`invalid ${name}`); return d.toISOString(); };
-const normPid = (v) => { const m = String(v).trim().match(/(\d+)$/); if (!m) throw bad(`invalid product id ${v}`); return "PROD-" + m[1]; };
-const qty = (v) => { const s = String(need(v, "quantity")).trim(); if (!/^\d+$/.test(s) || Number(s) < 1) throw bad("invalid quantity"); return Number(s); };
-
-/* ---------- translators (PA4, rewritten to take bytes) ---------- */
-function translateWeb(b) {
-  const c = need(b.customer, "customer"); const a = need(c.address, "customer.address");
-  return {
-    orderId: String(need(b.orderId, "orderId")), orderType: need(b.orderType, "orderType"), source: "web",
-    receivedAt: new Date().toISOString(), orderDate: iso(need(b.orderDate, "orderDate"), "orderDate"),
-    customer: { name: need(c.name, "customer.name"), email: need(c.email, "customer.email"),
-      address: { street: need(a.street, "street"), city: need(a.city, "city"), postalCode: need(a.postalCode, "postalCode"), country: need(a.country, "country") } },
-    items: (Array.isArray(b.items) ? b.items : (() => { throw bad("missing items"); })())
-      .map((i) => ({ productId: normPid(need(i?.productId, "productId")), productName: i.productName, quantity: qty(i.quantity) })),
-    currency: need(b.currency, "currency"), status: need(b.status, "status"),
-  };
-}
-const MOB_STATUS = { 1: "new", 2: "processing", 3: "shipped", 4: "delivered" };
-const MOB_CUR = { 978: "EUR", 840: "USD", 826: "GBP" };
-function translateMobile(b) {
-  const parts = String(need(b.addr, "addr")).split(",").map((s) => s.trim());
-  if (parts.length < 4) throw bad("invalid addr");
-  const country = parts.pop(), postalCode = parts.pop(), city = parts.pop(), street = parts.join(", ");
-  const status = typeof b.st === "string" ? b.st : MOB_STATUS[b.st];
-  const currency = typeof b.cur === "string" ? b.cur : MOB_CUR[b.cur];
-  if (!status) throw bad("invalid st"); if (!currency) throw bad("invalid cur");
-  const ts = need(b.ts, "ts");
-  return {
-    orderId: String(need(b.oid, "oid")), orderType: need(b.ot, "ot"), source: "mobile",
-    receivedAt: new Date().toISOString(), orderDate: iso(typeof ts === "number" ? ts * 1000 : ts, "ts"),
-    customer: { name: need(b.cust_name, "cust_name"), email: need(b.cust_email, "cust_email"), address: { street, city, postalCode, country } },
-    items: (Array.isArray(b.items) ? b.items : (() => { throw bad("missing items"); })())
-      .map((i) => ({ productId: normPid(need(i?.pid, "pid")), productName: i.pname, quantity: qty(i.qty) })),
-    currency, status,
-  };
-}
-function decodeXml(raw, ctype) {
-  let enc = (/charset\s*=\s*["']?([^;"'\s]+)/i.exec(ctype || "") || [])[1];
-  if (!enc) enc = (/^\s*<\?xml[^>]*encoding\s*=\s*["']([^"']+)["']/i.exec(raw.subarray(0, 200).toString("latin1")) || [])[1] || "utf-8";
-  try { return new TextDecoder(enc).decode(raw); } catch { return raw.toString("utf8"); }
-}
-const xml = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", parseTagValue: false, parseAttributeValue: false, trimValues: true, isArray: (n) => n === "LineItem" });
-function translateB2b(raw, ctype) {
-  let doc;
-  try { doc = xml.parse(decodeXml(raw, ctype)); } catch { throw bad("unparseable XML"); }
-  const po = need(doc?.PurchaseOrder, "PurchaseOrder");
-  const buyer = need(po.BuyerParty, "BuyerParty"); const ship = need(buyer.ShipToAddress, "ShipToAddress");
-  const lines = need(po.LineItems, "LineItems");
-  let date = po["@_orderDate"];
-  if (!date && po.ContractDate) { const m = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec(po.ContractDate); if (m) date = `${m[3]}-${m[2]}-${m[1]}T00:00:00Z`; }
-  const items = lines.LineItem; if (!Array.isArray(items)) throw bad("missing LineItem");
-  return {
-    orderId: String(need(po["@_orderId"], "orderId")), orderType: po["@_orderType"] || "b2b", source: "b2b",
-    receivedAt: new Date().toISOString(), orderDate: iso(need(date, "orderDate"), "orderDate"),
-    customer: { name: need(buyer.Name, "Name"), email: need(buyer.ContactEmail, "ContactEmail"),
-      address: { street: need(ship.Street, "Street"), city: need(ship.City, "City"), postalCode: need(ship.PostalCode, "PostalCode"), country: need(ship["@_country"], "country") } },
-    items: items.map((i) => ({ productId: normPid(need(i["@_sku"], "sku")), productName: i.Description, quantity: qty(i["@_quantity"]) })),
-    currency: need(lines["@_currency"], "currency"), status: String(need(po.Status, "Status")).toLowerCase(),
-  };
-}
-
-/* ---------- pricing ---------- */
-async function fetchPrice(pid, cid, causation) {
-  try {
-    const r = await fetch(`${PRICING_URL}/pricing/${pid}`, {
-      headers: { "X-API-Key": PRICING_KEY, "X-Correlation-Id": cid, "X-Causation-Id": causation },
-      signal: AbortSignal.timeout(TIMEOUT),
-    });
-    if (r.status === 404) return { unknown: true };
-    if (r.status !== 200) return { down: true };
-    const p = await r.json();
-    if (p?.unitPrice === undefined || p?.unitPrice === null || !isFinite(Number(p.unitPrice))) return { down: true };
-    return { p };
-  } catch { return { down: true }; }
-}
-async function enrich(order, cid, causation) {
-  const pids = [...new Set(order.items.map((i) => i.productId))];
-  const results = new Map(await Promise.all(pids.map(async (p) => [p, await fetchPrice(p, cid, causation)])));
-  if ([...results.values()].some((r) => r.down)) throw new Reject(503, { code: "pricing_unavailable" }, { "Retry-After": "1" });
-  const unknown = pids.filter((p) => results.get(p).unknown);
-  if (unknown.length) throw new Reject(422, { code: "unknown_product", productIds: unknown }, {}, true);
-  for (const i of order.items) {
-    const p = results.get(i.productId).p;
-    i.productName = p.productName || i.productName;
-    i.unitPrice = Number(p.unitPrice).toFixed(2);
-    i.currency = p.currency;
-    i.taxRate = p.taxRate;
-  }
-}
+const validate = ajv.compile(JSON.parse(fs.readFileSync(path.join(env.CANONICAL_DIR || "/canonical", "order.schema.json"), "utf8")));
 
 /* ---------- broker ---------- */
-let pubCh = null, connected = false, consuming = false;
-const ALLOWED_FROM_PROCESSING = ["parked", "completed", "failed", "compensated", "compensation_failed", "needs_attention"];
-function allowed(from, to) {
-  if (from === "accepted") return to !== "accepted";
-  if (from === "processing") return ALLOWED_FROM_PROCESSING.includes(to);
-  if (from === "parked") return to === "processing" || ALLOWED_FROM_PROCESSING.includes(to);
-  if (from === "compensation_failed" || from === "needs_attention") return to === "compensated" || to === "compensation_failed";
-  return false;
+let pubCh = null, subCh = null, connected = false, consuming = false;
+const inflight = new Set();
+const compensating = new Set();
+const lastHop = new Map();
+
+function publishConfirmed(ex, rk, body, opts) {
+  return new Promise((resolve, reject) => {
+    if (!pubCh) return reject(new Error("no channel"));
+    const t = setTimeout(() => reject(new Error("confirm timeout")), 5000);
+    try {
+      pubCh.publish(ex, rk, Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body)),
+        { persistent: true, contentType: "application/json", ...opts }, (err) => { clearTimeout(t); err ? reject(err) : resolve(); });
+    } catch (e) { clearTimeout(t); reject(e); }
+  });
 }
-function onOutcome(msg, ch) {
+function hop(h) {
+  const id = h.id || randomUUID();
+  lastHop.set(h.cid, id);
   try {
-    const env_ = JSON.parse(msg.content.toString("utf8"));
-    const cid = msg.properties.headers?.correlationId || env_.correlationId;
-    const rec = orders[cid];
-    const to = env_.state || String(msg.fields.routingKey).replace(/^order\./, "");
-    if (rec && allowed(rec.state, to)) {
-      rec.state = to;
-      if (env_.code !== undefined) rec.code = env_.code; else delete rec.code;
-      if (to === "duplicate" && env_.duplicateOf) rec.duplicateOf = env_.duplicateOf;
-      rec.updatedAt = new Date().toISOString();
-      save("orders.json", orders);
-    }
-  } catch (e) { console.error("outcome event ignored:", e.message); }
-  ch.ack(msg);
+    const t0 = h.t0 || new Date(), t1 = h.t1 || new Date();
+    pubCh?.publish("trace.events", "", Buffer.from(JSON.stringify({
+      hopId: id, correlationId: h.cid, causationId: h.cause ?? null, service: "orchestrator", operation: h.op,
+      status: h.status || "success", attempt: h.attempt || 1, ...(h.messageId ? { messageId: h.messageId } : {}),
+      startedAt: t0.toISOString(), finishedAt: t1.toISOString(), durationMs: t1 - t0, ...(h.detail ? { detail: h.detail } : {}),
+    })), { persistent: true, contentType: "application/json", messageId: randomUUID(), headers: { correlationId: h.cid } });
+  } catch {}
+  return id;
 }
+async function publishOutcome(saga, cid, cause) {
+  const id = randomUUID(), t0 = new Date(), mid = randomUUID();
+  await publishConfirmed("orders.outcome", saga.outcome.routingKey, saga.outcome.envelope,
+    { messageId: mid, headers: { correlationId: cid, causationId: id } });
+  hop({ id, cid, cause, op: "saga.outcome", t0, t1: new Date(), messageId: mid });
+  return id;
+}
+
+/* ---------- provider calls ---------- */
+async function call(base, p, body, key, cid, hopId) {
+  const headers = { "Content-Type": "application/json", "X-Correlation-Id": cid, "X-Causation-Id": hopId };
+  if (key) headers["Idempotency-Key"] = key;
+  try {
+    const r = await fetch(URLS[base] + p, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(TIMEOUT) });
+    if (r.ok) { await r.text().catch(() => {}); return { ok: true }; }
+    let code; try { const j = await r.json(); code = j.code || j.error; } catch {}
+    return { ok: false, temp: r.status >= 500, code: code || (r.status >= 500 ? "service_unavailable" : "error_" + r.status) };
+  } catch (e) {
+    return { ok: false, temp: true, code: (e.name === "TimeoutError" || e.name === "AbortError") ? "timeout" : "unreachable" };
+  }
+}
+async function doStep(op, base, p, body, key, cid, cause, attempt, messageId) {
+  const id = randomUUID(), t0 = new Date();
+  const r = await call(base, p, body, key, cid, id);
+  hop({ id, cid, cause, op, attempt, messageId, t0, t1: new Date(),
+    status: r.ok ? "success" : (r.code === "timeout" ? "timeout" : "failed"), detail: r.ok ? undefined : { code: r.code } });
+  return { ...r, hopId: id };
+}
+const STEPS = {
+  payment: { base: "payment", path: "/payment/authorize", key: (bk) => `authorize:${bk}` },
+  inventory: { base: "inventory", path: "/inventory/reserve", key: (bk) => `reserve:${bk}` },
+  shipping: { base: "shipping", path: "/shipping/create" },
+  notification: { base: "notification", path: "/notification/send" },
+};
+const COMP = {
+  payment: { op: "payment_refund", base: "payment", path: "/payment/refund", key: (bk) => `refund:${bk}` },
+  inventory: { op: "inventory_release", base: "inventory", path: "/inventory/release", key: (bk) => `release:${bk}` },
+};
+function amountOf(order) {
+  let cents = 0;
+  for (const i of order.items) cents += Math.round(Number(i.unitPrice) * 100) * i.quantity;
+  return `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, "0")}`;
+}
+function orderIdOf(bk) { return bk.slice(bk.indexOf(":") + 1); }
+function completedOf(saga) { return saga.steps.filter((s) => s.status === "completed").map((s) => s.step); }
+function compensatedOf(saga) { return saga.compensations.filter((c) => c.status === "completed").map((c) => c.step); }
+
+// Runs the outstanding compensations in reverse order. Returns null on success, or the failed call result.
+async function compensateAll(saga, cid, cause) {
+  const orderId = orderIdOf(saga.businessKey);
+  let chain = cause;
+  for (const st of [...completedOf(saga)].reverse()) {
+    const c = COMP[st];
+    if (!c || compensatedOf(saga).includes(c.op)) continue;
+    const r = await doStep(c.op, c.base, c.path, { orderId }, c.key(saga.businessKey), cid, chain, 1);
+    chain = r.hopId;
+    saga.compensations.push({ step: c.op, status: r.ok ? "completed" : "failed", at: now() });
+    saga.updatedAt = now();
+    await save();
+    if (!r.ok) return { ...r, chain };
+  }
+  return { ok: true, chain };
+}
+
+/* ---------- saga ---------- */
+function envelopeOf(saga, cid) { return saga.outcome.envelope; }
+async function finish(saga, cid, base, state, code, cause) {
+  saga.state = state; delete saga.retry; saga.updatedAt = now();
+  saga.outcome = { routingKey: "order." + state, envelope: { ...base, state, ...(code ? { code } : {}), occurredAt: now() } };
+  await save();
+  await publishOutcome(saga, cid, cause);
+}
+function markStuck(saga, cid) {
+  const base = { ...saga.outcome.envelope }; delete base.code; delete base.duplicateOf;
+  saga.state = "needs_attention"; delete saga.retry; saga.updatedAt = now();
+  saga.outcome = { routingKey: "order.needs_attention", envelope: { ...base, state: "needs_attention", occurredAt: now() } };
+  return hop({ cid, cause: lastHop.get(cid) || randomUUID(), op: "saga.stuck", detail: { reason: "orchestrator restarted mid-saga" } });
+}
+async function detectStuck() {
+  for (const [cid, saga] of Object.entries(store.sagas)) {
+    if (saga.state === "processing" && !saga.retry && saga.owner !== RUN_ID && !inflight.has(cid) && saga.outcome) {
+      const h = markStuck(saga, cid);
+      await save();
+      try { await publishOutcome(saga, cid, h); } catch (e) { console.error("stuck publish failed", e.message); }
+    }
+  }
+}
+const ack = (m) => { try { subCh.ack(m); } catch {} };
+const nack = (m) => { try { subCh.nack(m, false, false); } catch {} };
+function attemptOf(hdr) {
+  const d = hdr["x-death"]; let n = 0;
+  if (Array.isArray(d)) for (const e of d) if (e.queue === SAGA_Q && e.reason === "rejected") n += Number(e.count);
+  return n + 1;
+}
+
+async function handle(msg) {
+  const t0 = new Date();
+  const hdr = msg.properties.headers || {};
+  const cid = hdr.correlationId;
+  let order = null;
+  try { order = JSON.parse(msg.content.toString("utf8")); if (!cid || !validate(order)) order = null; } catch { order = null; }
+  if (!order) {
+    await publishConfirmed("orders.invalid.exchange", "", msg.content, { messageId: msg.properties.messageId, headers: hdr });
+    if (cid) hop({ cid, cause: hdr.causationId, op: "invalid.quarantine", status: "quarantined", t0, t1: new Date() });
+    return ack(msg);
+  }
+  if (inflight.has(cid)) return ack(msg);
+  inflight.add(cid);
+  try {
+    const bk = `${order.source}:${order.orderId}`;
+    const attempt = attemptOf(hdr);
+    const consumeId = hop({ cid, cause: hdr.causationId, op: "saga.consume", attempt, t0, messageId: msg.properties.messageId });
+    const base = { correlationId: cid, businessKey: bk, orderId: order.orderId, source: order.source, orderType: order.orderType, recipient: order.customer.email };
+    let saga = store.sagas[cid];
+
+    // ---- synchronous decision section (no await: keeps dedupe race-free) ----
+    if (saga && TERMINAL.includes(saga.state)) {
+      await publishOutcome(saga, cid, consumeId);                 // redelivery
+      return ack(msg);
+    }
+    if (saga && saga.state === "processing" && !saga.retry) {     // steps ran under a dead run
+      const h = markStuck(saga, cid);
+      await save();
+      await publishOutcome(saga, cid, h);
+      return ack(msg);
+    }
+    if (!saga) {
+      const first = store.businessKeys[bk];
+      if (first && first !== cid) {
+        saga = store.sagas[cid] = { businessKey: bk, state: "duplicate", steps: [], compensations: [], owner: RUN_ID, updatedAt: now(),
+          outcome: { routingKey: "order.duplicate", envelope: { ...base, state: "duplicate", duplicateOf: first, occurredAt: now() } } };
+        const dh = hop({ cid, cause: consumeId, op: "saga.dedupe", status: "duplicate" });
+        await save();
+        await publishOutcome(saga, cid, dh);
+        return ack(msg);
+      }
+      saga = store.sagas[cid] = { businessKey: bk, state: "processing", steps: [], compensations: [], owner: RUN_ID, updatedAt: now(), outcome: null };
+      store.businessKeys[bk] = cid;
+    }
+    // ---- end of synchronous section ----
+
+    let prev = consumeId;
+    if (!saga.retry) {                                            // new run, or a replay from parked
+      saga.state = "processing"; saga.owner = RUN_ID; saga.steps = []; saga.compensations = []; delete saga.failureCode;
+      saga.outcome = { routingKey: "order.processing", envelope: { ...base, state: "processing", occurredAt: now() } };
+      saga.updatedAt = now();
+      await save();
+      prev = await publishOutcome(saga, cid, consumeId);
+    }
+    saga.owner = RUN_ID;
+
+    const plan = order.orderType === "b2b" ? ["inventory", "shipping", "notification"] : ["payment", "inventory", "shipping", "notification"];
+    const amount = amountOf(order);
+    for (let i = 0; i < plan.length; i++) {
+      const s = plan[i], d = STEPS[s];
+      const body = s === "payment" ? { orderId: order.orderId, amount }
+        : s === "inventory" ? { orderId: order.orderId, items: order.items }
+        : s === "shipping" ? { orderId: order.orderId } : { orderId: order.orderId, recipient: order.customer.email };
+      const r = await doStep(s, d.base, d.path, body, d.key ? d.key(bk) : undefined, cid, prev, attempt, msg.properties.messageId);
+      prev = r.hopId;
+      if (r.ok) {
+        if (i === 0) delete saga.retry;
+        saga.steps.push({ step: s, status: "completed", at: now() });
+        saga.updatedAt = now();
+        await save();
+        continue;
+      }
+      saga.steps.push({ step: s, status: "failed", at: now() });
+      if (i === 0) {
+        if (r.temp) {
+          if (attempt < MAX_RETRIES) {
+            saga.retry = true; saga.updatedAt = now(); await save();
+            hop({ cid, cause: consumeId, op: "saga.retry", status: "retried", attempt });
+            return nack(msg);
+          }
+          const dlId = randomUUID();
+          await publishConfirmed("orders.dlq.exchange", "", msg.content, { messageId: randomUUID(),
+            headers: { correlationId: cid, causationId: dlId, businessKey: bk, originQueue: SAGA_Q, lastError: `${s} ${r.code}`, attempts: attempt, deadLetteredAt: now() } });
+          hop({ id: dlId, cid, cause: prev, op: "saga.dead_letter", status: "dead_lettered", attempt, detail: { code: r.code } });
+          await finish(saga, cid, base, "parked", undefined, dlId);
+          return ack(msg);
+        }
+        await finish(saga, cid, base, "failed", r.code, prev);
+        return ack(msg);
+      }
+      // a later step failed: compensate in reverse
+      saga.failureCode = r.code;
+      const c = await compensateAll(saga, cid, prev);
+      if (c.ok) await finish(saga, cid, base, "compensated", r.code, c.chain);
+      else await finish(saga, cid, base, "compensation_failed", c.code, c.chain);
+      return ack(msg);
+    }
+    await finish(saga, cid, base, "completed", undefined, prev);
+    return ack(msg);
+  } finally { inflight.delete(cid); }
+}
+
 async function connectLoop() {
   for (;;) {
     try {
@@ -172,113 +273,55 @@ async function connectLoop() {
       const closed = new Promise((r) => conn.on("close", () => r()));
       const pub = await conn.createConfirmChannel(); pub.on("error", () => {});
       const sub = await conn.createChannel(); sub.on("error", () => {});
-      await sub.assertQueue(OUTCOME_Q, { durable: true });
-      await sub.bindQueue(OUTCOME_Q, "orders.outcome", "#");
-      await sub.prefetch(20);
-      await sub.consume(OUTCOME_Q, (m) => { if (m) onOutcome(m, sub); });
-      pubCh = pub; consuming = true; connected = true;
+      pubCh = pub; subCh = sub;
+      await detectStuck();
+      await sub.prefetch(CONC);
+      await sub.consume(SAGA_Q, (m) => {
+        if (!m) return;
+        handle(m).catch((e) => { console.error("handler error:", e.message); nack(m); });
+      });
+      connected = true; consuming = true;
       console.log("broker connected");
       await closed;
     } catch (e) { console.error("broker error:", e.message); }
-    pubCh = null; connected = false; consuming = false;
+    pubCh = null; subCh = null; connected = false; consuming = false;
     await new Promise((r) => setTimeout(r, 1000));
   }
 }
-function publishConfirmed(exchange, body, headers, messageId, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    if (!pubCh) return reject(new Error("no channel"));
-    const timer = setTimeout(() => reject(new Error("confirm timeout")), timeoutMs);
-    try {
-      pubCh.publish(exchange, "", Buffer.from(JSON.stringify(body)),
-        { persistent: true, contentType: "application/json", messageId, headers },
-        (err) => { clearTimeout(timer); err ? reject(err) : resolve(); });
-    } catch (e) { clearTimeout(timer); reject(e); }
-  });
-}
-function emitHop(h) {   // fire-and-forget wire tap
-  try {
-    pubCh?.publish("trace.events", "", Buffer.from(JSON.stringify(h)),
-      { persistent: true, contentType: "application/json", messageId: randomUUID(), headers: { correlationId: h.correlationId } });
-  } catch {}
-}
 
-/* ---------- POST /orders ---------- */
-async function processOrder(raw, ctype) {
-  const cid = randomUUID();
-  const ids = { receive: randomUUID(), translate: randomUUID(), enrich: randomUUID(), publish: randomUUID() };
-  const T = {}; const mark = (k) => (T[k] = new Date());
-  mark("start");
-  const media = (ctype || "").split(";")[0].trim().toLowerCase();
-  let order;
-  if (media === "application/xml" || media === "text/xml") {
-    order = translateB2b(raw, ctype);
-  } else if (media === "application/json") {
-    let b; try { b = JSON.parse(raw.toString("utf8")); } catch { throw bad("unparseable JSON"); }
-    if (!b || typeof b !== "object" || Array.isArray(b)) throw bad("body must be a JSON object");
-    if (b.orderId !== undefined && b.customer && typeof b.customer === "object") order = translateWeb(b);
-    else if (b.oid !== undefined) order = translateMobile(b);
-    else throw bad("not a web or mobile order");
-  } else {
-    throw new Reject(415, { code: "unsupported_media_type" });
-  }
-  if (order.items.length > ITEMS_MAX) throw bad(`more than ${ITEMS_MAX} items`);
-  mark("translated");
-  await enrich(order, cid, ids.enrich);
-  mark("enriched");
-  if (!validateOrder(order)) throw bad("order does not match the canonical schema: " + ajv.errorsText(validateOrder.errors));
-  const businessKey = `${order.source}:${order.orderId}`;
-  orders[cid] = { correlationId: cid, businessKey, orderId: order.orderId, source: order.source, orderType: order.orderType, state: "accepted", updatedAt: new Date().toISOString() };
-  const messageId = randomUUID();
-  try {
-    await publishConfirmed("orders.exchange", order, { correlationId: cid, causationId: ids.publish, businessKey }, messageId);
-  } catch (e) {
-    delete orders[cid];
-    throw new Reject(503, { code: "broker_unavailable" }, { "Retry-After": "2" });
-  }
-  mark("published");
-  const hop = (op, id, cause, a, b, extra = {}) => emitHop({ hopId: id, correlationId: cid, causationId: cause, service: "intake", operation: op,
-    status: "success", attempt: 1, startedAt: T[a].toISOString(), finishedAt: T[b].toISOString(), durationMs: T[b] - T[a], ...extra });
-  hop("intake.receive", ids.receive, null, "start", "published");
-  hop("intake.translate", ids.translate, ids.receive, "start", "translated");
-  hop("intake.enrich", ids.enrich, ids.translate, "translated", "enriched");
-  hop("intake.publish", ids.publish, ids.enrich, "enriched", "published", { messageId });
-  return { status: 202, body: { correlationId: cid, status: "accepted" }, remember: true, correlationId: cid };
-}
-
+/* ---------- HTTP ---------- */
 const app = express();
-app.post("/orders", express.raw({ type: () => true, limit: "2mb" }), async (req, res) => {
-  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
-  const send = (status, body, headers = {}) => { for (const [k, v] of Object.entries(headers)) res.set(k, v); res.status(status).json(body); };
-  const key = req.get("Idempotency-Key");
-  if (!key || !/^[A-Za-z0-9._:-]{1,128}$/.test(key)) return send(400, { code: "validation_error", message: "missing or malformed Idempotency-Key" });
-  const sha = createHash("sha256").update(raw).digest("hex");
-  const done = idem[key];
-  if (done) return done.bodySha256 !== sha ? send(409, { code: "idempotency_payload_mismatch" }) : send(done.response.status, done.response.body);
-  if (inflight.has(key)) return send(409, { code: inflight.get(key) !== sha ? "idempotency_payload_mismatch" : "idempotency_conflict" });
-  inflight.set(key, sha);
-  let result;
-  try {
-    result = await processOrder(raw, req.get("Content-Type"));
-  } catch (e) {
-    if (e instanceof Reject) result = { status: e.status, body: e.body, headers: e.headers, remember: e.remember };
-    else { console.error(e); result = { status: 500, body: { code: "internal_error" } }; }
-  }
-  try {
-    if (result.remember) {
-      idem[key] = { bodySha256: sha, state: "done", response: { status: result.status, body: result.body }, ...(result.correlationId ? { correlationId: result.correlationId } : {}), createdAt: new Date().toISOString() };
-      await Promise.all([save("idempotency-store.json", idem), save("orders.json", orders)]);
-    }
-  } finally { inflight.delete(key); }
-  send(result.status, result.body, result.headers);
-});
-
-app.get("/orders/:cid", (req, res) => {
-  const rec = orders[req.params.cid];
-  rec ? res.json(rec) : res.status(404).json({ code: "not_found" });
-});
+app.use(express.json());
 app.get("/health", (_req, res) => {
   const ok = connected && consuming;
-  res.status(ok ? 200 : 503).json({ status: ok ? "ok" : "degraded", checks: { broker: connected ? "up" : "down", consumers: consuming ? { [OUTCOME_Q]: 1 } : {} } });
+  res.status(ok ? 200 : 503).json({ status: ok ? "ok" : "degraded", checks: { broker: connected ? "up" : "down", consumers: consuming ? { [SAGA_Q]: 1 } : {} } });
+});
+app.get("/sagas/stuck", (_req, res) => {
+  const sagas = Object.entries(store.sagas).filter(([, s]) => s.state === "needs_attention" || s.state === "compensation_failed")
+    .map(([cid, s]) => ({ correlationId: cid, businessKey: s.businessKey, state: s.state, completedSteps: completedOf(s), compensatedSteps: compensatedOf(s), since: s.updatedAt }));
+  res.json({ sagas });
+});
+app.post("/sagas/:cid/compensate", async (req, res) => {
+  const cid = req.params.cid, saga = store.sagas[cid];
+  if (!saga) return res.status(404).json({ code: "not_found" });
+  if (compensating.has(cid)) return res.status(409).json({ code: "compensation_in_progress" });
+  if (saga.state === "compensated" && saga.operatorCompensation) return res.json({ correlationId: cid, state: "compensated" });
+  if (saga.state !== "needs_attention" && saga.state !== "compensation_failed") return res.status(409).json({ code: "saga_not_stuck" });
+  compensating.add(cid);
+  try {
+    const wasStuck = saga.state === "needs_attention";
+    const t0 = new Date(), opId = randomUUID();
+    const c = await compensateAll(saga, cid, opId);
+    const base = { ...saga.outcome.envelope }; delete base.code; delete base.duplicateOf;
+    const state = c.ok ? "compensated" : "compensation_failed";
+    const code = c.ok ? (wasStuck ? "operator_compensated" : (saga.failureCode || "operator_compensated")) : c.code;
+    saga.operatorCompensation = { at: now(), state };
+    await finish(saga, cid, base, state, code, opId);
+    hop({ id: opId, cid, cause: lastHop.get(cid), op: "saga.operator_compensate", t0, t1: new Date(), detail: { state } });
+    res.json({ correlationId: cid, state });
+  } catch (e) {
+    console.error(e); res.status(500).json({ code: "internal_error" });
+  } finally { compensating.delete(cid); }
 });
 
 process.on("unhandledRejection", (e) => console.error("unhandled:", e));
