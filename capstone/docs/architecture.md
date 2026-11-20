@@ -1,44 +1,96 @@
 # Architecture
 
-<!--
-Capstone architecture (README §6, R-6.1). Keep the two ## headings exactly as
-they are, and put one ```mermaid block under each. The stage 6 tests check
-that both are there, and that the integration diagram names at least 6 of the
-exchanges and queues in README §3.2. No manual points, but the defence starts
-here: you explain your system from these two diagrams.
-
-Comments like this one are prompts. They do not count as your text, and
-nobody grades them: delete each one when you have written its section.
-
-Mermaid renders on GitHub. Check yours there, or at https://mermaid.live.
--->
-
 ## System context
-
-<!--
-Your system from the outside: who sends it orders (web, mobile, a b2b
-partner), who operates it, and which providers it calls (pricing, payment,
-inventory, shipping, notification; Temporal if you build the advanced
-component). Your system can be one box here, or your four services.
-
-The syntax, not the answer. (A plain arrow is two dashes and a ">"; an HTML
-comment cannot show one, so this example uses the thick arrow.)
 
 ```mermaid
 flowchart LR
-  partner[B2B partner] ==>|POST /orders, XML| intake
+    Web[Web client]
+    Mobile[Mobile client]
+    B2B[B2B partner]
+
+    subgraph System[Order Integration System]
+        Intake[Order Intake Service]
+        Orchestrator[Saga Orchestrator]
+        Observer[Observer Service]
+    end
+
+    Pricing[Pricing Provider]
+    Payment[Payment Provider]
+    Inventory[Inventory Provider]
+    Shipping[Shipping Provider]
+    Notification[Notification Provider]
+    Operator[System Operator]
+
+    Web -->|POST /orders| Intake
+    Mobile -->|POST /orders| Intake
+    B2B -->|POST /orders XML| Intake
+
+    Intake --> Orchestrator
+    Orchestrator --> Pricing
+    Orchestrator --> Payment
+    Orchestrator --> Inventory
+    Orchestrator --> Shipping
+    Orchestrator --> Notification
+
+    Operator -->|Monitoring and recovery| Intake
+    Operator -->|Saga management| Orchestrator
+    Operator -->|Tracing and metrics| Observer
 ```
--->
 
 ## Integration architecture
 
-<!--
-Inside the system: your services, every exchange and queue of README §3.2,
-and the paths a message can take. Show the retry path (the retry queue and
-its way back), the DLQ and the invalid channel, the outcome events and who
-consumes them, and the wire tap into trace.store. Label an edge with its
-routing key where one matters.
+```mermaid
+flowchart TD
+    Clients[Web / Mobile / B2B clients]
+    Intake[Order Intake Service]
+    Orchestrator[Saga Orchestrator]
+    Observer[Observer Service]
+    Notifier[Notification Consumer]
 
-Draw what your code does, not what the brief says. If your notifier
-consumes something the brief does not mention, it is in the diagram.
--->
+    subgraph RabbitMQ[RabbitMQ]
+        OrdersExchange[orders.exchange]
+        SagaQueue[saga.queue]
+        RetryQueue[saga.retry.queue]
+
+        ReturnExchange[orders.return.exchange]
+
+        OutcomeQueue[orders.outcome]
+        NotificationsQueue[notifications.queue]
+
+        TraceEvents[trace.events]
+        TraceStore[trace.store]
+
+        DLQExchange[orders.dlq.exchange]
+        DLQ[orders.dlq]
+
+        InvalidExchange[orders.invalid.exchange]
+        InvalidQueue[orders.invalid]
+    end
+
+    Clients -->|POST /orders| Intake
+
+    Intake -->|Valid order| OrdersExchange
+    Intake -->|Invalid order| InvalidExchange
+    InvalidExchange --> InvalidQueue
+
+    OrdersExchange --> SagaQueue
+    SagaQueue -->|Consume order| Orchestrator
+
+    Orchestrator -->|Retryable failure| RetryQueue
+    RetryQueue -->|Retry message| ReturnExchange
+    ReturnExchange -->|Return to processing| OrdersExchange
+
+    Orchestrator -->|Unrecoverable failure| DLQExchange
+    DLQExchange --> DLQ
+
+    Orchestrator -->|Order result| OutcomeQueue
+    OutcomeQueue --> NotificationsQueue
+    NotificationsQueue --> Notifier
+
+    Intake -->|Trace events| TraceEvents
+    Orchestrator -->|Trace events| TraceEvents
+    Observer -->|Publish or collect trace events| TraceEvents
+    TraceEvents -->|Wire tap| TraceStore
+    TraceStore --> Observer
+```
+
